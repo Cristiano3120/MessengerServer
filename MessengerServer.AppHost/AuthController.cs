@@ -5,6 +5,7 @@ using MessengerServer.AppHost.UserResources;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
+using NpgsqlTypes;
 using System.Net;
 using System.Net.Mail;
 
@@ -38,8 +39,8 @@ namespace MessengerServer.AppHost
         [HttpPost("create")]
         public async Task<IActionResult> CreateAcc([FromBody] User user)
         {
-            byte[] emailHash = DatabaseCryptography.Hash(user.Email!);
-            SnowflakeGenerator snowflakeGenerator = new(0);
+            byte[] emailHash = DatabaseCryptography.HashDeterministic(user.Email!);
+            ulong userId = new SnowflakeGenerator(0).GenerateId();
 
             (bool emailInUse, bool usernameInUse) = await CheckUserCreationAsync(emailHash, user.Username!);
 
@@ -86,12 +87,13 @@ namespace MessengerServer.AppHost
                 });
             }
 
+            
             _ = Task.Run(async () =>
             {
                 EncryptedUser encryptedUser = default!;
                 try
                 {
-                    byte[] passwordHash = DatabaseCryptography.Hash(user.Password!);
+                    byte[] passwordHash = DatabaseCryptography.HashNonDeterministic(user.Password!);
                     byte[] emailEncrypted = DatabaseCryptography.Encrypt(user.Email!);
 
                     encryptedUser = new()
@@ -104,7 +106,7 @@ namespace MessengerServer.AppHost
                         ProfilPicture = user.ProfilPicture,
                         TFAEnabled = user.TFAEnabled!.Value,
                         Birthday = user.Birthday,
-                        Id = snowflakeGenerator.GenerateId(),
+                        Id = userId,
                     };
 
                     DbContextOptions<PostgresDbContext> options = new DbContextOptionsBuilder<PostgresDbContext>()
@@ -126,7 +128,7 @@ namespace MessengerServer.AppHost
 
             APIResponse<ulong> aPIResponse = new()
             {
-                Data = snowflakeGenerator.GenerateId(),
+                Data = userId,
                 IsSuccess = true,
             };
 
@@ -159,18 +161,37 @@ namespace MessengerServer.AppHost
         [HttpPost("login")]
         public async Task<IActionResult> LoginAsync([FromBody] LoginData loginData)
         {
-            byte[] emailHash = DatabaseCryptography.Hash(loginData.Email);
-            byte[] passwordHash = DatabaseCryptography.Hash(loginData.Password);
+            byte[] emailHash = DatabaseCryptography.HashDeterministic(loginData.Email);
 
-            DbContextOptions<PostgresDbContext> options = new DbContextOptionsBuilder<PostgresDbContext>()
-                .UseNpgsql(_connStr).Options;
+            await using NpgsqlConnection conn = new(_connStr);
+            await conn.OpenAsync();
 
-            await using PostgresDbContext dbContext = new(options);
+            const string sql = @"
+                SELECT ""Id"", ""Username"", ""ProfilPicture"", ""Biography"", ""TFAEnabled"", ""Birthday""
+                FROM ""Users""
+                WHERE ""EmailHash"" = @email;";
 
-            EncryptedUser? encryptedUser = await dbContext.Users
-                .FirstOrDefaultAsync(x => x.EmailHash == emailHash);
+            await using NpgsqlCommand cmd = new(sql, conn);
+            _ = cmd.Parameters.AddWithValue("email", emailHash);
 
-            if (encryptedUser is null || encryptedUser is not null && encryptedUser.PasswordHash != passwordHash)
+            await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync();
+            EncryptedUser? encryptedUser = null;
+
+            if (await reader.ReadAsync())
+            {
+                encryptedUser = new EncryptedUser
+                {
+                    Id = (ulong)reader.GetInt64(0),
+                    Username = reader.GetString(1),
+                    ProfilPicture = (byte[])reader[2],
+                    Biography = reader.GetString(3),
+                    TFAEnabled = reader.GetBoolean(4),
+                    Birthday = DateOnly.FromDateTime(reader.GetDateTime(5))
+                };
+            }
+
+            if (encryptedUser is null || encryptedUser is not null 
+                && !DatabaseCryptography.VerifyHash(loginData.Password, encryptedUser.PasswordHash))
             {
                 APIResponse<object> aPIResponse = new()
                 {
@@ -201,7 +222,7 @@ namespace MessengerServer.AppHost
 
             if (tFAEnabled is true)
             {
-                int verificationCode = Random.Shared.Next(1_000_000, 10_000_000);
+                int verificationCode = Random.Shared.Next(10_000_000, 99_999_999);
                 Timer timer = new(DeleteVerificationCodeEntry, user.Id, TimeSpan.FromMinutes(5), Timeout.InfiniteTimeSpan);
 
                 (int, Timer) tuple = (verificationCode, timer);
@@ -225,13 +246,36 @@ namespace MessengerServer.AppHost
                     });
                 }
 
-                DbContextOptions<PostgresDbContext> options = new DbContextOptionsBuilder<PostgresDbContext>()
-                        .UseNpgsql(_connStr).Options;
+                await using NpgsqlConnection conn = new(_connStr);
+                await conn.OpenAsync();
 
-                await using PostgresDbContext dbContext = new(options);
+                const string sql = @"
+                    SELECT ""Id"", ""Username"", ""ProfilPicture"", ""Biography"", ""TFAEnabled"", ""Birthday"", ""EmailHash"", ""PasswordHash"", ""Email""
+                    FROM ""Users""
+                    WHERE ""Id"" = @id
+                    LIMIT 1;";
 
-                EncryptedUser? encryptedUser = await dbContext.Users
-                        .FirstOrDefaultAsync(x => x.Id == verify.UserId);
+                await using NpgsqlCommand cmd = new(sql, conn);
+                _ = cmd.Parameters.AddWithValue("id", NpgsqlDbType.Numeric, (decimal)verify.UserId);
+
+                await using NpgsqlDataReader reader = await cmd.ExecuteReaderAsync();
+
+                EncryptedUser? encryptedUser = null;
+                if (await reader.ReadAsync())
+                {
+                    encryptedUser = new EncryptedUser
+                    {
+                        Id = (ulong)reader.GetInt64(0),
+                        Username = reader.GetString(1),
+                        ProfilPicture = (byte[])reader[2],
+                        Biography = reader.GetString(3),
+                        TFAEnabled = reader.GetBoolean(4),
+                        Birthday = DateOnly.FromDateTime(reader.GetDateTime(5)),
+                        EmailHash = (byte[])reader[6],
+                        PasswordHash = (byte[])reader[7],
+                        Email = (byte[])reader[8]
+                    };
+                }
 
                 if (encryptedUser is null)
                 {
@@ -375,6 +419,14 @@ namespace MessengerServer.AppHost
                 _fields.FailedUsers.Add(user);
                 _fields.SaveFailedUsersTask ??= Task.Run(SaveFailedUsersAsync);
             }
+        }
+
+        private PostgresDbContext CreateDbContext()
+        {
+            DbContextOptions<PostgresDbContext> options = new DbContextOptionsBuilder<PostgresDbContext>()
+                .UseNpgsql(_connStr).Options;
+
+            return new PostgresDbContext(options);
         }
     }
 }

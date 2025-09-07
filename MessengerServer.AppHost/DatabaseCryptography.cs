@@ -4,6 +4,7 @@ using MessengerServer.AppHost.Logging;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
+using static System.Net.Mime.MediaTypeNames;
 
 namespace MessengerServer.AppHost
 {
@@ -41,7 +42,9 @@ namespace MessengerServer.AppHost
             return key;
         }
 
-        public static byte[] Hash(string text)
+
+
+        public static byte[] HashNonDeterministic(string text)
         {
             Span<byte> salt = stackalloc byte[16];
             RandomNumberGenerator.Fill(salt);
@@ -59,6 +62,19 @@ namespace MessengerServer.AppHost
             salt.CopyTo(hashWithSalt.AsSpan(hash.Length));
 
             return hashWithSalt;
+        }
+
+        public static byte[] HashDeterministic(string text)
+        {
+            using Rfc2898DeriveBytes pbkdf2 = new(
+                password: text,
+                salt: [],
+                iterations: HashingIterations,
+                _hashAlgorithmName);
+
+            byte[] hash = pbkdf2.GetBytes(32);
+
+            return hash;
         }
 
 
@@ -86,7 +102,7 @@ namespace MessengerServer.AppHost
 
             aesGcm.Encrypt(nonce, plaintextBytes, ciphertext, tag);
 
-            // alles zusammenpacken: [nonce | tag | ciphertext]
+            // put it all into one: [nonce | tag | ciphertext]
             byte[] result = new byte[nonce.Length + tag.Length + ciphertext.Length];
             Buffer.BlockCopy(nonce, 0, result, 0, nonce.Length);
             Buffer.BlockCopy(tag, 0, result, nonce.Length, tag.Length);

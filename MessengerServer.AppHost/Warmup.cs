@@ -52,7 +52,8 @@ namespace MessengerServer.AppHost
             {
                 Stopwatch stopwatch = Stopwatch.StartNew();
 
-                _ = DatabaseCryptography.Hash("testHash123456789!");
+                _ = DatabaseCryptography.HashDeterministic("testHash123456789!");
+                _ = DatabaseCryptography.HashNonDeterministic("testHash123456789!");
                 byte[] data = DatabaseCryptography.Encrypt("test@example.com");
                 _ = DatabaseCryptography.Decrypt(data);
 
